@@ -12,18 +12,38 @@
  * https://github.com/tockn/MPU6050_tockn
  * https://github.com/DFRobot/DFRobotDFPlayerMini
  * https://github.com/bolderflight/sbus
+ * https://github.com/ArminJo/ServoEasing
  * 
  **/
 
+ 
+ /**
+  * Channel mapping
+  * 0: Throttle 1
+  * 1: Throttle 2
+  * 2: Head twist (manual control)
+  * 3: Nod angle (manual control)
+  * 4: Manual control toggle switch
+  * 5: Nothing
+  * 6: Momentary sound trigger
+  * 7: Sound selection
+  * 8: Head tilt 
+  * 9: Nothing
+  * 10: IMU Nod control
+  * 11: IMU Head Twist 
+  * 12: Volume knob (not working currently)
+  */
+
 #include "Arduino.h"
 #include <Wire.h>
-#include <Servo.h>
+#include <ServoEasing.h>
 #include <MPU6050_tockn.h>
 #include "sbus.h"
 #include "DFRobotDFPlayerMini.h"
 
 ///////////////////////////////
 // Configuration
+///////////////////////////////
 
 // RC
 #define RC_MIN 172
@@ -46,9 +66,6 @@
 #define PID_I 0
 #define PID_D 0.8
 
-// Rolling input average
-#define ROLLING_AVERAGE 6
-
 ///////////////////////////////
 
 // MPU
@@ -61,15 +78,22 @@ bool lostFrame;
 
 // Sound
 DFRobotDFPlayerMini myDFPlayer;
-int currentsound = 1;
+int currentSound = 1;
 int soundTimer;
 bool soundPlaying = false;
+int volume = 30;
 
 // Servos
-Servo ServoNod;
-Servo ServoTwist;
-Servo ServoTilt;
-Servo ServoMainBar;
+ServoEasing servoNod;
+ServoEasing servoTwist;
+ServoEasing servoTilt;
+ServoEasing servoMainBar;
+
+// Servo values
+int nodAngle = 90;
+int twistAngle = 90;
+int tiltAngle = 90;
+int mainBarAngle = 85;
 
 // PID
 float elapsedTime, time, timePrev;
@@ -93,20 +117,10 @@ int motordirection2 = HIGH;
 // Mode 1: Manual control of head movements
 // Mode 2: Animation mode
 
-bool mode = 0;
-
 // @deprecate
 bool manualControl = false;
 
-// Rolling average
-// NOTE: This isn't necessary for the main bar
-int tiltValues[ROLLING_AVERAGE];
-int twistValues[ROLLING_AVERAGE];
-int nodValues[ROLLING_AVERAGE];
-int tiltAverage = 0;
-int twistAverage = 0;
-int nodAverage = 0;
-int rollingAverageIndex = 0;
+/*****************************************************************************/
 
 void setup()
 {
@@ -121,16 +135,16 @@ void setup()
     pinMode(PWM2, OUTPUT);
 
     // Attach servos
-    ServoMainBar.attach(SERVO_PIN_MAINBAR);
-    ServoNod.attach(SERVO_PIN_NOD);
-    ServoTwist.attach(SERVO_PIN_TWIST);
-    ServoTilt.attach(SERVO_PIN_TILT);
+    servoMainBar.attach(SERVO_PIN_MAINBAR);
+    servoNod.attach(SERVO_PIN_NOD);
+    servoTwist.attach(SERVO_PIN_TWIST);
+    servoTilt.attach(SERVO_PIN_TILT);
 
     // Center all servos
-    ServoMainBar.write(90);
-    ServoNod.write(90);
-    ServoTwist.write(90);
-    ServoTilt.write(90);
+    servoMainBar.write(85);
+    servoNod.writeMicroseconds(1500);
+    servoTwist.writeMicroseconds(1500);
+    servoTilt.writeMicroseconds(1500);
 
     // Wait for servos to center
     delay(1000);
@@ -143,19 +157,20 @@ void setup()
     // gyroXOffset = mpu6050.
 
     // Set up DFPlayer
-    if (!myDFPlayer.begin(Serial2))
+    if (!myDFPlayer.begin(Serial2, false))
     {
         while (true)
             ;
     }
-    Serial.println(F("DFPlayer Mini online."));
-    myDFPlayer.volume(5);
+    myDFPlayer.volume(volume);
     delay(1000);
     myDFPlayer.play(1);
     delay(3000);
 
     time = millis();
 }
+
+/*****************************************************************************/
 
 void loop()
 {
@@ -246,32 +261,66 @@ void loop()
     }
 }
 
+/*****************************************************************************
+// Servos
+******************************************************************************/
+void handleServos()
+{
+    // Handle manual control of servos
+    if (manualControl)
+    {
+        nodAngle = map(sbus_rx.rx_channels()[3], RC_MIN, RC_MAX, 1700, 1200);
+        twistAngle = map(sbus_rx.rx_channels()[2], RC_MIN, RC_MAX, 1700, 1200);
+    }
+    else // IMU control
+    {
+        nodAngle = map(sbus_rx.rx_channels()[10], 283, 1700, 1200, 1700);
+        twistAngle = map(sbus_rx.rx_channels()[11], RC_MIN, RC_MAX, 2000, 1000);
+    }
+
+    tiltAngle = map(sbus_rx.rx_channels()[8], RC_MIN, RC_MAX, 1200, 1700);
+    mainBarAngle = map(sbus_rx.rx_channels()[10], 283, 1700, 1700, 1200);
+
+    // Update Servos
+    servoMainBar.writeMicroseconds(mainBarAngle);
+    servoTwist.writeMicroseconds(twistAngle);
+    servoTilt.writeMicroseconds(tiltAngle);
+    servoNod.writeMicroseconds(nodAngle);
+}
+
+/*****************************************************************************
+// Handle sound selection and triggering 
+******************************************************************************/
 void handleSound()
 {
-    static unsigned long timer = millis();
-
     // Volume
-    int vol = map(sbus_rx.rx_channels()[7], RC_MIN, RC_MAX, 0, 30);
-    myDFPlayer.volume(vol);
+    // TODO: Seems to be a bug in the DFPlayer library where volume isn't set correctly outside
+    // of the setup function.
+//    int newVolume = map(sbus_rx.rx_channels()[12], RC_MIN, RC_MAX, 0, 30);
+//    if (newVolume != volume)
+//    {
+//        myDFPlayer.volume(volume);
+//        volume = newVolume;
+//    }
 
     // Select sound group and pick a random sound
     if (sbus_rx.rx_channels()[7] < 500)
     {
-        currentsound = random(3, 5);
+        currentSound = random(3, 5);
     }
     else if (sbus_rx.rx_channels()[7] > 500 && sbus_rx.rx_channels()[7] < 1500)
     {
-        currentsound = random(6, 10);
+        currentSound = random(6, 10);
     }
     else
     {
-        currentsound = random(11, 14);
+        currentSound = random(11, 14);
     }
 
     // Trigger the sound
     if (sbus_rx.rx_channels()[6] > 1000 && !soundPlaying)
     {
-        myDFPlayer.play(currentsound);
+        myDFPlayer.play(currentSound);
         soundPlaying = true;
         soundTimer = millis();
     }
@@ -283,54 +332,10 @@ void handleSound()
     }
 }
 
-void handleServos()
-{
-    // Handle manual control of servos
-    if (manualControl)
-    {
-        nodValues[rollingAverageIndex] = map(sbus_rx.rx_channels()[9], RC_MIN, RC_MAX, 40, 140);
-        twistValues[rollingAverageIndex] = map(sbus_rx.rx_channels()[2], RC_MIN, RC_MAX, 140, 40);
-    }
-    else
-    {
-        nodValues[rollingAverageIndex] = map(sbus_rx.rx_channels()[3], RC_MIN, RC_MAX, 40, 140);
-        twistValues[rollingAverageIndex] = map(sbus_rx.rx_channels()[11], RC_MIN, RC_MAX, 140, 40);
-    }
-
-    tiltValues[rollingAverageIndex] = map(sbus_rx.rx_channels()[8], RC_MIN, RC_MAX, 40, 140);
-
-    updateInputAverages();
-
-    rollingAverageIndex++;
-
-    if (rollingAverageIndex >= ROLLING_AVERAGE)
-    {
-        rollingAverageIndex = 0;
-    }
-
-    ServoMainBar.write(map(sbus_rx.rx_channels()[10], RC_MIN, RC_MAX, 120, 60));
-    ServoTwist.write(twistAverage);
-    ServoTilt.write(tiltAverage);
-    ServoNod.write(nodAverage);
-}
-
-void updateInputAverages()
-{
-    for (int i = 0; i < ROLLING_AVERAGE; i++)
-    {
-        tiltAverage += tiltValues[i];
-        twistAverage += twistValues[i];
-        nodAverage += nodValues[i];
-    }
-    tiltAverage = tiltAverage / ROLLING_AVERAGE;
-    twistAverage = twistAverage / ROLLING_AVERAGE;
-    nodAverage = nodAverage / ROLLING_AVERAGE;
-}
-
-/**
+/*****************************************************************************
  * If we lose connetion or the transmitter shuts off then halt D-O and
  * center all servos
- **/
+ *****************************************************************************/
 void handleFailsafe()
 {
     // Halt
@@ -338,8 +343,8 @@ void handleFailsafe()
     analogWrite(PWM2, 0);
 
     // Center all servos
-    ServoMainBar.write(90);
-    ServoNod.write(90);
-    ServoTwist.write(90);
-    ServoTilt.write(90);
+    servoMainBar.write(85);
+    servoNod.write(90);
+    servoTwist.write(90);
+    servoTilt.write(90);
 }
